@@ -2,6 +2,7 @@ package jmx
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -10,18 +11,28 @@ import (
 	"testing"
 	"time"
 
+	"github.com/newrelic/infra-integrations-sdk/log"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
-	timeout      = 1000
-	openAttempts = 5
+	timeoutMillis = 1500
+	openAttempts  = 10
+	// jmx mock cmds
+	cmdEmpty         = "empty"
+	cmdCrash         = "crash"
+	cmdInvalid       = "invalid"
+	cmdTimeout       = "timeout"
+	cmdBigPayload    = "bigPayload"
+	cmdBigPayloadErr = "bigPayloadError"
 )
 
 var query2IsErr = map[string]bool{
-	"empty":   false,
-	"crash":   true,
-	"invalid": true,
+	cmdEmpty:   false,
+	cmdCrash:   true,
+	cmdInvalid: true,
+	//cmdTimeout: true, // flaky test
 }
 
 func TestMain(m *testing.M) {
@@ -32,29 +43,32 @@ func TestMain(m *testing.M) {
 	if testType == "" {
 		// Set the NR_JMX_TOOL to ourselves (the test binary) with the extra
 		// parameter test.type=helper and run the tests as usual.
-		os.Setenv("NR_JMX_TOOL", fmt.Sprintf("%s -test.type helper --", os.Args[0]))
+		_ = os.Setenv("NR_JMX_TOOL", fmt.Sprintf("%s -test.type helper --", os.Args[0]))
 		os.Exit(m.Run())
 	} else if testType == "helper" {
 		// The test suite becomes a JMX Tool
 		scanner := bufio.NewScanner(os.Stdin)
 		for scanner.Scan() {
 			command := scanner.Text()
-			if command == "empty" {
+			if command == cmdEmpty {
 				fmt.Println("{}")
-			} else if command == "crash" {
+			} else if command == cmdCrash {
 				os.Exit(1)
-			} else if command == "invalid" {
+			} else if command == cmdInvalid {
 				fmt.Println("not a json")
-			} else if command == "timeout" {
-				time.Sleep(1000 * time.Millisecond)
+			} else if command == cmdTimeout {
+				time.Sleep(timeoutMillis + 200*time.Millisecond)
 				fmt.Println("{}")
-			} else if command == "bigPayload" {
+			} else if command == cmdBigPayload {
 				// Create a payload of more than 64K
-				fmt.Println(fmt.Sprintf("{\"first\": 1%s}", strings.Repeat(", \"s\": 2", 70*1024)))
-			} else if command == "bigPayloadError" {
+				str := fmt.Sprintf("{\"first\": 1%s}", strings.Repeat(", \"s\": 2", 70*1024))
+				fmt.Println(str)
+			} else if command == cmdBigPayloadErr {
 				// Create a payload of more than 4M
-				fmt.Println(fmt.Sprintf("{\"first\": 1%s}", strings.Repeat(", \"s\": 2", 4*1024*1024)))
+				str := fmt.Sprintf("{\"first\": 1%s}", strings.Repeat(", \"s\": 2", 4*1024*1024))
+				fmt.Println(str)
 			}
+
 		}
 		os.Exit(0)
 	}
@@ -63,21 +77,29 @@ func TestMain(m *testing.M) {
 func TestOpenWithParameters_OnlyWorksWhenClosed(t *testing.T) {
 	defer Close()
 
-	assert.NoError(t, Open("", "", "", ""))
-	assert.Error(t, Open("", "", "", ""))
+	assert.NoError(t, OpenNoAuth("", ""))
+	assert.Error(t, OpenNoAuth("", ""))
 	Close()
-	assert.NoError(t, Open("", "", "", ""))
+	assert.NoError(t, OpenNoAuth("", ""))
+}
+
+func TestOpenURL(t *testing.T) {
+	defer Close()
+
+	assert.NoError(t, OpenURL("sample.url", "", ""))
+	lastArg := cmd.Args[len(cmd.Args)-1]
+	assert.Equal(t, "sample.url", lastArg)
 }
 
 func TestQuery(t *testing.T) {
 	for q, isErr := range query2IsErr {
-		assert.NoError(t, openWait("", "", "", "", openAttempts), "error on opening for query %s", q)
+		require.NoError(t, openWait("", "", "", "", openAttempts), "error on opening for query %s", q)
 
-		_, err := Query(q, timeout)
+		_, err := Query(q, timeoutMillis)
 		if isErr {
-			assert.Error(t, err)
+			assert.Error(t, err, "case "+q)
 		} else {
-			assert.NoError(t, err)
+			assert.NoError(t, err, "case "+q)
 		}
 		Close()
 	}
@@ -85,32 +107,27 @@ func TestQuery(t *testing.T) {
 
 func TestQuery_WithSSL(t *testing.T) {
 	for q, isErr := range query2IsErr {
-		assert.NoError(t, openWaitWithSSL("", "", "", "", "", "", "", "", openAttempts))
+		require.NoError(t, openWaitWithSSL("", "", "", "", "", "", "", "", openAttempts))
 
-		_, err := Query(q, timeout)
+		_, err := Query(q, timeoutMillis)
+
 		if isErr {
-			assert.Error(t, err)
+			assert.Error(t, err, "case "+q)
 		} else {
-			assert.NoError(t, err)
+			assert.NoError(t, err, "case "+q)
 		}
 		Close()
 	}
 }
 
-func TestQuery_TimeoutReturnsError(t *testing.T) {
-	defer Close()
+func TestOpen_WithNrjmx(t *testing.T) {
+	aux := os.Getenv("NR_JMX_TOOL")
+	require.NoError(t, os.Unsetenv("NR_JMX_TOOL"))
 
-	if err := openWait("", "", "", "", openAttempts); err != nil {
-		t.Error(err)
-	}
+	assert.Error(t, OpenNoAuth("", "", WithNrJmxTool("/foo")), "/foo is not an executable")
+	assert.Equal(t, "/foo", cmd.Args[0])
 
-	if _, err := Query("timeout", timeout); err == nil {
-		t.Error()
-	}
-
-	if _, err := Query("empty", timeout); err == nil {
-		t.Error()
-	}
+	require.NoError(t, os.Setenv("NR_JMX_TOOL", aux))
 }
 
 func TestJmxNoTimeoutQuery(t *testing.T) {
@@ -122,7 +139,7 @@ func TestJmxNoTimeoutQuery(t *testing.T) {
 		t.Error(err)
 	}
 
-	if _, err := Query("timeout", 1500); err != nil {
+	if _, err := Query(cmdTimeout, timeoutMillis+1000); err != nil {
 		t.Error(err)
 	}
 }
@@ -136,11 +153,11 @@ func TestJmxTimeoutBigQuery(t *testing.T) {
 		t.Error(err)
 	}
 
-	if _, err := Query("bigPayload", timeout); err != nil {
+	if _, err := Query(cmdBigPayload, timeoutMillis); err != nil {
 		t.Error(err)
 	}
 
-	if _, err := Query("bigPayloadError", timeout); err == nil {
+	if _, err := Query(cmdBigPayloadErr, timeoutMillis); err == nil {
 		t.Error()
 	}
 }
@@ -155,7 +172,7 @@ func openWaitWithSSL(hostname, port, username, password, keyStore, keyStorePassw
 	err := Open(hostname, port, username, password, ssl)
 	if err == ErrJmxCmdRunning && attempts > 0 {
 		attempts--
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 
 		return openWaitWithSSL(hostname, port, username, password, keyStore, keyStorePassword, trustStore, trustStorePassword, attempts)
 	}
@@ -163,22 +180,27 @@ func openWaitWithSSL(hostname, port, username, password, keyStore, keyStorePassw
 	return err
 }
 
-// test that if we receive a WARNING message we still will receive the actual data.
-func TestLoop(t *testing.T) {
-	defer flushWarnings()
+func Test_receiveResult_warningsDoNotBreakResultReception(t *testing.T) {
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+
 	_, cancelFn := context.WithCancel(context.Background())
 
-	lineCh := make(chan []byte, jmxLineBuffer*2)
-	queryErrors := make(chan error)
-	outTimeout := time.Duration(timeout) * time.Millisecond
-	receiveResult(lineCh, queryErrors, cancelFn, "empty", outTimeout)
-	warningMessage := "WARNING foo bar"
-	cmdErr <- fmt.Errorf(warningMessage)
-	errorChannel := <-cmdErr
-	assert.Equal(t, errorChannel, fmt.Errorf(warningMessage))
-	b := []byte("{foo}")
-	lineCh <- b
-	msg := string(<-lineCh)
-	assert.Equal(t, msg, "{foo}")
+	resultCh := make(chan []byte, 1)
+	queryErrCh := make(chan error)
+	cmdErrC := make(chan error)
+	outTimeout := time.Duration(timeoutMillis) * time.Millisecond
+	warningMessage := fmt.Sprint("WARNING foo bar")
+	cmdWarnC <- warningMessage
 
+	resultCh <- []byte("{\"foo\":1}")
+
+	result, err := receiveResult(resultCh, cmdErrC, queryErrCh, cancelFn, "foo", outTimeout)
+
+	assert.NoError(t, err)
+	assert.Equal(t, map[string]interface{}{
+		"foo": 1.,
+	}, result)
+	assert.Equal(t, fmt.Sprintf("[WARN] %s\n", warningMessage), buf.String())
 }
